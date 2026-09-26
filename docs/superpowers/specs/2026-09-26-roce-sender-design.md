@@ -1,7 +1,7 @@
 # RoCE Sender v0.1 设计
 
 日期：2026-09-26
-状态：待用户评审；本文描述拟实现行为，尚无产品代码。
+状态：设计已复核并实现；离线与模拟发送测试通过，Linux 实发及设备验收待环境验证。
 项目：`/Users/victory/vibe_prj/roce-sender`
 
 ## 1. 目标与已知约束
@@ -84,9 +84,9 @@ RC 数据模板不自动建立或推断连接状态。WRITE 参数只是报文�
 - UDP 校验计算值为 0 时在线上写入 0xffff；主动禁用校验时才写入 0。
 - 按最终长度构造 IP/UDP；长度字段包含最终 4 字节 ICRC。
 - ICRC 以 RoCE 所属 IP/UDP/BTH 和后续数据为范围，包含协议填充；排除 Ethernet/VLAN、VXLAN 外层和 ICRC 自身。
-- ICRC 前置 8 字节全 0xff 的虚拟 LRH；屏蔽 IPv4 TOS、TTL、头校验和、UDP 校验和与 BTH QPN 高 8 位；采用 IEEE CRC32，结果按 RoCE 线上字节序写入。
+- ICRC 前置 8 字节全 0xff 的虚拟 LRH；将 IPv4 TOS、TTL、头校验和、UDP 校验和与 BTH QPN 高 8 位设为全 1；采用 IEEE CRC32，结果按 little-endian 写入。
 - `--bad-icrc` 对正确 ICRC 的固定一位取反，然后基于损坏后的内容计算 UDP 校验，以隔离 ICRC 错误因素。
-- 最终 Ethernet 帧至少补到 60 字节（不含 FCS）；链路层补齐不计入 IP/UDP 长度或 ICRC。
+- 最外层 Ethernet 帧至少补到 60 字节（不含 FCS）；链路层补齐不计入 IP/UDP 长度或 ICRC。VXLAN 内层只包含 Ethernet 头和实际 IP 数据，不附加最小帧补齐。
 - Ethernet FCS 由发包硬件处理，PCAP 不附加 FCS。
 - `--mtu` 默认 1500，表示线上最外层 IP 包上限；VXLAN 开销和内层 VLAN 必须计入。
 - send 模式还受实际接口 MTU 限制，取二者较小值。超限在发送前报错，不截断，不隐式分片。
@@ -103,8 +103,10 @@ roce-sender send  [报文字段] [序列参数] --interface IFACE [发送控制]
 ```
 
 build 的 `--pcap` 与 `--hex` 必须且只能指定一个；不访问网络接口，不需要 root。
-PCAP 为经典微秒格式、DLT_EN10MB，流式写入；默认拒绝覆盖已有文件，可显式 `--overwrite`。
+PCAP 为经典 little-endian 微秒格式、DLT_EN10MB，snaplen=65553（最大 IPv4 加单层 VLAN Ethernet 头），流式写入；默认拒绝覆盖已有文件，可显式 `--overwrite`。
 build 使用固定起始时间戳 0，以 interval 递增；interval=0 时同一时间戳。输出可重复，不真实等待。
+build 的 interval 必须是整微秒，禁止静默舍入；生成前校验末帧时间戳不超过 uint32 秒范围，避免乘法溢出。
+参数、首包与 MTU 校验全部通过后才创建或截断文件；写入错误或中断保留部分文件并报出完整记录数，最后一条记录可能不完整。关闭文件错误也传播到退出码。
 hex 输出每帧一行纯十六进制，摘要输出 stderr；PCAP 路径为 `-` 时写 stdout，保证二进制流不混入日志。
 send 首版不同时保存 PCAP，避免将本地构造、提交发送和线上捕获混淆。
 
@@ -126,7 +128,7 @@ send 首版不同时保存 PCAP，避免将本地构造、提交发送和线上�
 
 无 outer 前缀的参数始终描述承载 RoCE 的 Ethernet/IP/UDP；VXLAN 模式下即内层。
 VXLAN I 标志置位，其余保留位为 0。仅 VXLAN 模式允许 outer/vni 参数，拼写错误或无效组合一律报错。
-字段整数接受十进制和 `0x` 十六进制；十进制前导零不触发八进制解析。
+字段整数接受十进制和 `0x` 十六进制；十进制前导零不触发八进制解析。重复参数、额外位置参数均拒绝；组合约束按参数是否显式出现判断，包含空值与 false。
 所有输入先按足够宽的类型解析、校验范围，再转换；不静默溢出。
 
 send 需要显式 interface，不猜测默认路由。直接模式可从接口补全源 MAC/IPv4；VXLAN 模式仅补全最外层源 MAC/IPv4，内层四个地址均须显式给出。
@@ -146,10 +148,13 @@ send 需要显式 interface，不猜测默认路由。直接模式可从接口�
 - build 只支持有限 count 或 psn-list；拒绝 duration/continuous/interface。
 - send 在首包构造与 MTU 校验通过后打开 socket；发送失败立即退出，报告已成功提交的帧数。
 - 间隔等待可被 Ctrl+C、SIGTERM 或到期计时打断；不使用不可取消的长 sleep。
-- 正常完成返回 0，参数/文件/发送错误返回非零；信号退出释放资源并打印中断状态和计数。
+- Linux socket 使用 CLOEXEC 和非阻塞模式；EINTR 重试，EAGAIN/ENOBUFS 按可取消的 1ms 等待重试，其他发送错误立即终止。duration 从 socket 就绪后开始计时。
+- 正常完成或 duration 到期返回 0，参数错误 2，构包/文件/发送错误 1；Ctrl+C/SIGTERM 返回 130，释放资源并打印中断状态和计数。
 - 摘要包含模板、封装、帧数、字节数、主要字段和 ICRC 模式；措辞使用 generated/submitted，不使用 delivered 或 RDMA completed。
 
-## 6. 命令示例（设计草案）
+## 6. 命令示例
+
+构建后使用 `./bin/roce-sender`，或将二进制加入 PATH 后执行以下命令。
 
 离线生成重复与乱序 PSN 的样本：
 
@@ -186,8 +191,8 @@ sudo roce-sender send --interface eth0 \
 | 模块 | 职责与边界 |
 | --- | --- |
 | main.go | 调用应用入口，处理进程退出码与版本注入 |
-| internal/cli | 子命令、flag 解析、帮助信息；错误返回调用者，不在解析器内 os.Exit |
-| internal/config | 参数存在性、范围、组合校验，生成不可变配置 |
+| internal/cli | 子命令、flag 解析、存在性/范围/组合校验、帮助信息；错误返回调用者，不在解析器内 os.Exit |
+| internal/config | 配置类型、默认值、纯报文字段校验；配置按值传递，构包不修改输入 |
 | internal/packet | 纯函数构造 Ethernet/VLAN/IP/UDP/RoCE/VXLAN，校验与摘要；不访问网卡、时钟或文件 |
 | internal/sequence | 根据配置与帧索引生成 PSN、端口等；显式序列只存字段，不缓存全部帧 |
 | internal/pcap | PCAP 编码、记录写入、短写与错误传播 |
@@ -195,7 +200,7 @@ sudo roce-sender send --interface eth0 \
 | internal/sender | Linux AF_PACKET socket；其他平台返回明确不支持发送错误 |
 | internal/app | 串联配置、序列、输出和取消；依赖可替换 writer/sender 进行集成测试 |
 
-依赖方向：CLI → config → app → sequence/packet → pcap 或 sender。
+依赖方向：main → app；app 调用 cli/netutil/sequence/packet/pcap/sender；各模块共享 config，packet 和 sequence 不依赖任何 I/O 模块。
 netutil 只在 send 的配置补全过程使用。Go 1.24.2 与现有开发环境一致；产品运行时只使用标准库，关闭 CGO。
 
 ## 8. 验证与验收
@@ -216,7 +221,7 @@ netutil 只在 send 的配置补全过程使用。Go 1.24.2 与现有开发环�
 
 ## 9. 研发顺序与交付物
 
-本节是阶段依赖概览；详细实现任务与执行方式在设计评审后确定。
+本节是阶段依赖概览；对应任务与执行记录见 [实现计划](../plans/2026-09-26-roce-sender-implementation.md)。
 
 1. 协议核心与独立测试向量：正确构造三个模板、校验与序列。
 2. 离线 CLI 与 PCAP：在当前 macOS 环境即可完整验证。
@@ -231,10 +236,36 @@ netutil 只在 send 的配置补全过程使用。Go 1.24.2 与现有开发环�
 
 访问日期：2026-09-26。研发时固定测试参考版本，避免随 master 漂移。
 
-- [Scapy RoCE 实现：BTH、CNP、ICRC](https://github.com/secdev/scapy/blob/master/scapy/contrib/roce.py)
-- [Linux RXE ICRC 实现](https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_icrc.c)
-- [Linux RXE opcode 布局](https://github.com/torvalds/linux/blob/master/drivers/infiniband/sw/rxe/rxe_opcode.c)
+- [Scapy 2.6.1 RoCE 实现：BTH、CNP、ICRC](https://github.com/secdev/scapy/blob/v2.6.1/scapy/contrib/roce.py)
+- [Linux 6.12 RXE ICRC 实现](https://github.com/torvalds/linux/blob/v6.12/drivers/infiniband/sw/rxe/rxe_icrc.c)
+- [Linux 6.12 RXE opcode 布局](https://github.com/torvalds/linux/blob/v6.12/drivers/infiniband/sw/rxe/rxe_opcode.c)
 - [rdma-core RC 连接示例](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/examples/rc_pingpong.c)
 - [perftest](https://github.com/linux-rdma/perftest)
 - [NVIDIA RoCE QoS 与拥塞配置](https://docs.nvidia.com/networking-ethernet-software/cumulus-linux-57/Layer-1-and-Switch-Ports/Quality-of-Service/RDMA-over-Converged-Ethernet-RoCE/)
 - [Cisco RoCE over VXLAN 部署](https://www.cisco.com/c/en/us/td/docs/dcn/whitepapers/roce-storage-implementation-over-nxos-vxlan-fabrics.pdf)
+
+## 11. 本轮评审与验收记录
+
+2026-09-26：在用户授权继续评审和实现后完成 v0.1 代码。未改动 vxlan-sender，未发布或提交远端。
+
+评审收敛的边界：
+
+1. 明确 ICRC 的 little-endian 输出、被屏蔽位取全 1，以及坏 ICRC 翻转 bit 0 后再计算 UDP 校验。
+2. 明确 VXLAN 内层不补 Ethernet 最小长度，MTU 包含内层 VLAN 和所有隧道头。
+3. PCAP 强制整微秒，预检最终时间戳；记录短写、关闭错误和部分输出语义。
+4. 使用显式参数存在性拒绝 CNP/WRITE/outer 字段错误组合、重复参数和输出模式冲突；`--hex=false --pcap FILE` 仍是冲突。
+5. Linux 非阻塞 socket 保证背压时可以取消，接口 MTU 校验与首包构造在打开 socket 前完成。
+
+已执行：
+
+- 22 个 Scapy 2.6.1 完整帧参考向量逐字节比较通过。
+- SEND/WRITE padding 0～3、空数据、ICRC 不变量、坏 ICRC 保持正确 UDP、最大字段与序列回绕、VLAN/VXLAN MTU 边界通过。
+- CLI 无效参数无文件副作用、PCAP 不覆盖、确定性输出、短写；模拟 count/list/失败/关闭错误、取消与 duration 调度通过。
+- 五类 CLI 示例实际导出 10 帧 PCAP，Scapy/zlib 独立解析与检查通过。
+- `go test ./...`、`go test -race ./...`、`go vet ./...` 通过；Linux amd64/arm64 产物经 file 确认为静态 ELF。
+
+未执行：Linux AF_PACKET 实际收发及 namespace/veth 抓包、真实 RNIC/VTEP 验收。操作步骤见 [Linux 验收文档](../../linux-validation.md)，不能以交叉编译或模拟测试替代。
+
+### 后续用途文档与代码 review
+
+README 已补充用途场景、模板选择、实验流程和证据判读。后续 review 修复了管道输出背压时无法取消的问题：Linux/macOS 为管道提供可取消的写入，首次信号后恢复默认信号处理，重复信号可强制退出。另修复版本输出错误传播，减少 ICRC/UDP 校验中的负载复制，提前检查 MTU。详见 [代码评审记录](../../code-review.md)。

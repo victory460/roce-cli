@@ -1,0 +1,7 @@
+/bin/
+*.pcap
+*.test
+/coverage.out
+__pycache__/
+.venv/
+.DS_Store

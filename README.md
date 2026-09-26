@@ -324,24 +324,3 @@ Linux/macOS 下，build 的管道输出在下游停止读取时也可由 Ctrl+C/
 receive 保存的是匹配帧的捕获字节（含校验错误帧），时间戳取本机读取时刻；恢复 Linux 辅助数据中提供的 VLAN 标签。解析范围为单层 VLAN、无 options/无分片的 IPv4、标准 VXLAN、现有三个模板；不支持其他 opcode、IPv6、PCAPNG、Linux cooked capture。inspect 支持经典 PCAP 大小端与微秒/纳秒时间戳，纳秒按微秒截断；截短记录直接报错。
 
 校验结论针对捕获字节。网卡硬件过滤、卸载和抓包位置可能影响能看到的帧及字段；这里没有通用抓包器的内核丢包统计，不能据 receive 数量计算精确丢包率。默认不启用混杂模式，也不改变接口/VTEP 配置。
-
-## 验证与边界
-
-Go 测试读取仓库中的 22 组 Scapy 2.6.1 固定向量，无需 Python。
-独立检查 CLI 导出的六种示例（包括 IPv4/UDP/ICRC、VLAN、端口递增和 PSN 字段）：
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install scapy==2.6.1
-.venv/bin/python scripts/verify_examples.py ./bin/roce-cli
-# 仅在有意更新参考向量时运行：
-.venv/bin/python scripts/generate_vectors.py
-```
-
-验证覆盖离线协议、CLI、模拟发送/接收与取消、PCAP 流式读取、畸形输入、decoder fuzz、race、vet 和 Linux 双架构静态编译。
-Linux 实际 AF_PACKET 发包、veth 抓包和真实 RNIC/VTEP 验收尚未执行；交叉编译不能替代这些验证。
-可按 [Linux 隔离验证步骤](docs/linux-validation.md) 完成实发验收。
-
-构包优化的测量方法及本轮修复见 [代码评审记录](docs/code-review.md)。
-
-[设计及评审决策](docs/superpowers/specs/2026-09-26-roce-cli-design.md) · [实现计划](docs/superpowers/plans/2026-09-26-roce-cli-implementation.md) · [测试向量来源](testdata/README.md)
